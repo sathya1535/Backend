@@ -10,6 +10,14 @@ from flask_mail import Mail, Message
 import requests
 import base64
 import json
+import pytesseract
+from PIL import Image
+import io
+import re
+
+# Explicit path to Tesseract executable for Windows
+# Note: Pointing to the specific exe file to avoid WinError 5 (Access Denied)
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe\tesseract.exe'
 
 app = Flask(__name__)
 CORS(app)
@@ -26,6 +34,17 @@ mail = Mail(app)
 
 # Dictionary to store OTPs temporarily (in-memory for now, can move to DB)
 otp_storage = {}
+
+# ML Model Loading
+model = None
+label_encoder = None
+try:
+    if os.path.exists('severity_model.pkl') and os.path.exists('label_encoder.pkl'):
+        model = joblib.load('severity_model.pkl')
+        label_encoder = joblib.load('label_encoder.pkl')
+        print("ML Model loaded successfully.")
+except Exception as e:
+    print(f"Failed to load ML model: {e}")
 
 # MySQL Connection config — reconnect per-request to avoid "Commands out of sync"
 DB_CONFIG = {
@@ -211,7 +230,7 @@ def init_db_schema():
                 risk_factors TEXT,
                 severity_score FLOAT,
                 severity_level VARCHAR(20),
-                analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (patient_id) REFERENCES patients(id) ON DELETE CASCADE
             )
         """)
@@ -223,6 +242,70 @@ def init_db_schema():
         cursor.close()
         conn.close()
 
+def predict_severity_with_ml(data):
+    global model, label_encoder
+    if model is None or label_encoder is None:
+        return None
+        
+    try:
+        # Extract and default features strictly as needed by model
+        bp = data.get("blood_pressure")
+        if bp in [None, ""]:
+            bp = "120/80"
+        try:
+            bp_sys = float(str(bp).split('/')[0])
+        except:
+            bp_sys = 120.0
+            
+        def extract_feature(key, default_val):
+            val = data.get(key)
+            if val in [None, "", "null", "NA"]:
+                return float(default_val)
+            try:
+                return float(val)
+            except ValueError:
+                return float(default_val)
+                
+        features = [
+            extract_feature("temperature", 37.0),
+            extract_feature("heart_rate", 80.0),
+            extract_feature("respiratory_rate", 16.0),
+            bp_sys,
+            extract_feature("spo2", 98.0),
+            extract_feature("blood_glucose", 100.0),
+            extract_feature("wbc", 7000.0),
+            extract_feature("platelets", 250000.0),
+            extract_feature("hemoglobin", 14.0),
+            extract_feature("crp", 5.0),
+            extract_feature("esr", 10.0),
+            extract_feature("creatinine", 0.9),
+            extract_feature("urea", 15.0),
+            extract_feature("bilirubin", 0.8),
+            extract_feature("ast", 25.0),
+            extract_feature("alt", 25.0),
+            extract_feature("inr", 1.0),
+            extract_feature("sodium", 140.0),
+            extract_feature("potassium", 4.0),
+            extract_feature("map", 85.0),
+            1.0 if data.get("troponin_positive") in [True, "true", "True", 1, "1", "positive"] else 0.0,
+            extract_feature("pao2_fio2", 450.0),
+            extract_feature("gcs", 15.0),
+            extract_feature("urine_output", 1500.0)
+        ]
+        pred = model.predict([features])
+        level_str = label_encoder.inverse_transform(pred)[0]
+        
+        # Mapping model labels to the application required labels
+        level_map = {
+            'Mild': 'MILD',
+            'Moderate': 'MODERATE',
+            'Severe': 'CRITICAL'
+        }
+        return level_map.get(level_str, level_str.upper())
+    except Exception as e:
+        print(f"ML Prediction Error: {e}")
+        return None
+
 def calculate_severity_score(data):
     """
     Unified severity calculation logic based on clinical parameters.
@@ -230,31 +313,41 @@ def calculate_severity_score(data):
     score = 0
     immediate_severe = False
     
-    # Values extraction
-    temp = float(data.get("temperature") or 0)
-    hr = int(data.get("heart_rate") or 0)
-    rr = int(data.get("respiratory_rate") or 0)
-    spo2 = int(data.get("spo2") or 0)
-    bg = float(data.get("blood_glucose") or 0)
-    map_val = float(data.get("map") or 0)
-    gcs = int(data.get("gcs") or 15)
-    troponin = bool(data.get("troponin_positive", False))
+    def get_num(key, default=0):
+        val = data.get(key)
+        if val in [None, "", "NA", "null"]: return default
+        # Handle cases like "10/15" or "120/80" by taking the first part
+        if isinstance(val, str) and "/" in val:
+            try: return float(val.split("/")[0])
+            except: return default
+        try: return float(val)
+        except: return default
     
-    wbc = float(data.get("wbc") or 0)
-    platelets = float(data.get("platelets") or 0)
-    hemoglobin = float(data.get("hemoglobin") or 0)
-    crp = float(data.get("crp") or 0)
-    esr = float(data.get("esr") or 0)
-    creatinine = float(data.get("creatinine") or 0)
-    urea = float(data.get("urea") or 0)
-    bilirubin = float(data.get("bilirubin") or 0)
-    ast = float(data.get("ast") or 0)
-    alt = float(data.get("alt") or 0)
-    inr = float(data.get("inr") or 0)
-    sodium = float(data.get("sodium") or 0)
-    potassium = float(data.get("potassium") or 0)
-    pao2_fio2 = float(data.get("pao2_fio2") or 0)
-    urine_output = float(data.get("urine_output") or 0)
+    # Values extraction with safety for 'NA'
+    temp = get_num("temperature")
+    hr = int(get_num("heart_rate"))
+    rr = int(get_num("respiratory_rate"))
+    spo2 = int(get_num("spo2"))
+    bg = get_num("blood_glucose")
+    map_val = get_num("map")
+    gcs = int(get_num("gcs", 15))
+    troponin = str(data.get("troponin_positive", False)).lower() in ['true', '1', 'positive']
+    
+    wbc = get_num("wbc")
+    platelets = get_num("platelets")
+    hemoglobin = get_num("hemoglobin")
+    crp = get_num("crp")
+    esr = get_num("esr")
+    creatinine = get_num("creatinine")
+    urea = get_num("urea")
+    bilirubin = get_num("bilirubin")
+    ast = get_num("ast")
+    alt = get_num("alt")
+    inr = get_num("inr")
+    sodium = get_num("sodium")
+    potassium = get_num("potassium")
+    pao2_fio2 = get_num("pao2_fio2")
+    urine_output = get_num("urine_output")
     
     # CBC
     if wbc > 0:
@@ -328,6 +421,12 @@ def calculate_severity_score(data):
         immediate_severe = True
         
     level = "CRITICAL" if (immediate_severe or score > 25) else "MODERATE" if score >= 12 else "MILD"
+    
+    # ML override is temporarily disabled to maintain clinical consistency with user review
+    # ml_level = predict_severity_with_ml(data)
+    # if ml_level:
+    #     level = ml_level
+    
     return score, level
 
 init_db_schema()
@@ -345,33 +444,44 @@ def analyze_severity():
     score = 0
     immediate_severe = False
     
+    def get_num(key, default=0):
+        val = data.get(key)
+        if val in [None, "", "NA", "null"]: return default
+        # Handle fractional strings by taking the first part
+        if isinstance(val, str) and "/" in val:
+            try: return float(val.split("/")[0])
+            except: return default
+        try: return float(val)
+        except: return default
+
     try:
-        # Vitals extraction with extra safety for None values
-        temp = float(data.get("temperature") or 0)
-        hr = int(data.get("heart_rate") or 0)
-        rr = int(data.get("respiratory_rate") or 0)
-        spo2 = int(data.get("spo2") or 0)
-        bg = float(data.get("blood_glucose") or 0)
-        map_val = float(data.get("map") or 0)
-        gcs = int(data.get("gcs") or 15)
-        troponin = bool(data.get("troponin_positive", False))
+        analyzed_at = datetime.now()
+        # Vitals extraction with extra safety for 'NA' values
+        temp = get_num("temperature")
+        hr = int(get_num("heart_rate"))
+        rr = int(get_num("respiratory_rate"))
+        spo2 = int(get_num("spo2"))
+        bg = get_num("blood_glucose")
+        map_val = get_num("map")
+        gcs = int(get_num("gcs", 15))
+        troponin = str(data.get("troponin_positive", False)).lower() in ['true', '1', 'positive']
         
         # Labs
-        wbc = float(data.get("wbc") or 0)
-        platelets = float(data.get("platelets") or 0)
-        hemoglobin = float(data.get("hemoglobin") or 0)
-        crp = float(data.get("crp") or 0)
-        esr = float(data.get("esr") or 0)
-        creatinine = float(data.get("creatinine") or 0)
-        urea = float(data.get("urea") or 0)
-        bilirubin = float(data.get("bilirubin") or 0)
-        ast = float(data.get("ast") or 0)
-        alt = float(data.get("alt") or 0)
-        inr = float(data.get("inr") or 0)
-        sodium = float(data.get("sodium") or 0)
-        potassium = float(data.get("potassium") or 0)
-        pao2_fio2 = float(data.get("pao2_fio2") or 0)
-        urine_output = float(data.get("urine_output") or 0)
+        wbc = get_num("wbc")
+        platelets = get_num("platelets")
+        hemoglobin = get_num("hemoglobin")
+        crp = get_num("crp")
+        esr = get_num("esr")
+        creatinine = get_num("creatinine")
+        urea = get_num("urea")
+        bilirubin = get_num("bilirubin")
+        ast = get_num("ast")
+        alt = get_num("alt")
+        inr = get_num("inr")
+        sodium = get_num("sodium")
+        potassium = get_num("potassium")
+        pao2_fio2 = get_num("pao2_fio2")
+        urine_output = get_num("urine_output")
         
         risk_factors = data.get("risk_factors", [])
         if isinstance(risk_factors, str):
@@ -473,6 +583,11 @@ def analyze_severity():
             
         severity_level = "CRITICAL" if (immediate_severe or score > 25) else "MODERATE" if score >= 12 else "MILD"
         
+        ml_level = predict_severity_with_ml(data)
+        if ml_level:
+            severity_level = ml_level
+            print(f"ML Prediction override applied: {ml_level}")
+        
         print(f"--- SEVERITY BREAKDOWN (Patient {patient_id}) ---")
         print(f"Breakdown: {breakdown}")
         print(f"Total Score: {score}")
@@ -507,6 +622,20 @@ def analyze_severity():
             SET severity_score = %s, severity_level = %s, last_vitals_date = %s
             WHERE id = %s
         """, (score, severity_level, analyzed_at, patient_id))
+
+        # 3. Trigger notification if critical
+        if severity_level == "CRITICAL":
+            try:
+                cursor.execute("SELECT name, assigned_doctor_id FROM patients WHERE id = %s", (patient_id,))
+                p_info = cursor.fetchone()
+                if p_info:
+                    target_doc_id = doctor_id if doctor_id and doctor_id != -1 else p_info['assigned_doctor_id']
+                    cursor.execute(
+                        "INSERT INTO notifications (title, message, target_role, doctor_id) VALUES (%s, %s, %s, %s)",
+                        ("Severity Alert", f"CRITICAL ALERT: Patient {p_info['name']} reached CRITICAL status", 'doctor', target_doc_id)
+                    )
+            except Exception as notify_err:
+                print(f"Error triggering severity notification: {notify_err}")
 
         conn.commit()
         
@@ -1329,14 +1458,28 @@ def add_symptom():
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
-        if isinstance(data.get("symptoms"), list):
-            for s in data.get("symptoms"):
-                cursor.execute(query, (data.get("patient_id"), s, datetime.now()))
-        else:
-            cursor.execute(query, (data.get("patient_id"), data.get("symptom_name"), datetime.now()))
+        symptoms_input = data.get("symptoms")
+        if not symptoms_input:
+            symptoms_input = [data.get("symptom_name")] if data.get("symptom_name") else []
+        
+        if not isinstance(symptoms_input, list):
+            symptoms_input = [s.strip() for s in str(symptoms_input).split(",") if s.strip()]
 
-        conn.commit()
-        return jsonify({"success": True, "message": "Symptoms Saved"})
+        # Filter symptoms to remove raw OCR text
+        symptoms_list = [
+            s for s in symptoms_input 
+            if s and len(str(s)) < 100 and 
+            "OCR" not in str(s).upper() and 
+            "PROCESSED" not in str(s).upper()
+        ]
+
+        if symptoms_list:
+            for s in symptoms_list:
+                cursor.execute(query, (data.get("patient_id"), s, datetime.now()))
+            conn.commit()
+            return jsonify({"success": True, "message": "Symptoms Saved"})
+        else:
+            return jsonify({"success": True, "message": "No valid symptoms to save"})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 400
     finally:
@@ -1484,18 +1627,24 @@ def save_analysis_result():
             INSERT INTO advanced_assessments (
                 patient_id, wbc, platelets, hemoglobin, crp, esr, creatinine, urea,
                 bilirubin, ast, alt, inr, sodium, potassium, map, troponin_positive,
-                pao2_fio2, gcs, urine_output, risk_factors, severity_score, severity_level, analyzed_at
+                pao2_fio2, gcs, urine_output, risk_factors, severity_score, severity_level, recorded_at
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             patient_id,
             data.get("wbc"), data.get("platelets"), data.get("hemoglobin"),
             data.get("crp"), data.get("esr"),
             data.get("creatinine"), data.get("urea"),
-            data.get("bilirubin"), data.get("ast"), data.get("alt"), data.get("inr"),
+            data.get("bilirubin"), data.get("ast"), data.get("alt"),
+            data.get("inr"),
             data.get("sodium"), data.get("potassium"),
             data.get("map"), data.get("troponin_positive"),
             data.get("pao2_fio2"), data.get("gcs"), data.get("urine_output"),
-            data.get("risk_factors"), score, level, now
+            # Clean risk factors before saving
+            ",".join([
+                rf.strip() for rf in str(data.get("risk_factors", "")).split(",") 
+                if rf.strip() and len(rf) < 100 and "OCR" not in rf.upper() and "PROCESSED" not in rf.upper()
+            ]),
+            score, level, now
         ))
 
         # 4. Insert into symptoms table (handle string or list)
@@ -1507,11 +1656,24 @@ def save_analysis_result():
             else:
                 symptoms_list = [s.strip() for s in symptoms_data.split(",") if s.strip()]
             
-            for symptom_name in symptoms_list:
-                cursor.execute(
-                    "INSERT INTO symptoms (patient_id, symptom_name, recorded_at) VALUES (%s, %s, %s)",
-                    (patient_id, symptom_name, now)
-                )
+            # Filter out entries that look like raw OCR text (too long or contains OCR markers)
+            symptoms_list = [
+                s for s in symptoms_list 
+                if len(s) < 100 and 
+                "OCR" not in s.upper() and 
+                "PROCESSED" not in s.upper() and
+                "EXTRACT" not in s.upper()
+            ]
+
+            if symptoms_list:
+                # Clear previous symptoms to avoid duplication
+                cursor.execute("DELETE FROM symptoms WHERE patient_id = %s", (patient_id,))
+                
+                for symptom_name in symptoms_list:
+                    cursor.execute(
+                        "INSERT INTO symptoms (patient_id, symptom_name, recorded_at) VALUES (%s, %s, %s)",
+                        (patient_id, symptom_name, now)
+                    )
 
         # 5. History tracking in analysis_results
         cursor.execute("""
@@ -1814,37 +1976,51 @@ def predict_severity():
     try:
         # Convert BP like "120/80" -> 120
         bp = data.get("blood_pressure", "0")
-        if isinstance(bp, str) and "/" in bp:
-            bp = float(bp.split("/")[0])
+        if bp == "NA" or bp is None:
+            bp = 0.0
+        elif isinstance(bp, str) and "/" in bp:
+            try: bp = float(bp.split("/")[0])
+            except: bp = 0.0
         else:
-            bp = float(bp)
+            try: bp = float(bp)
+            except: bp = 0.0
+
+        def get_num(key, default=0):
+            val = data.get(key)
+            if val in [None, "", "NA", "null"]: return float(default)
+            # Handle fractional strings by taking the first part
+            if isinstance(val, str) and "/" in val:
+                try: return float(val.split("/")[0])
+                except: return float(default)
+            try: return float(val)
+            except: return float(default)
 
         # Map database fields to ML model features
         features = [
-            float(data.get("temperature", 0)),
-            float(data.get("heart_rate", 0)),
-            float(data.get("respiratory_rate", 0)),
+            get_num("temperature", 0),
+            get_num("heart_rate", 0),
+            get_num("respiratory_rate", 0),
             bp,
-            float(data.get("spo2", 0)),
-            float(data.get("blood_glucose", 0)),
-            float(data.get("wbc", 0)),
-            float(data.get("platelets", 0)),
-            float(data.get("hemoglobin", 0)),
-            float(data.get("crp", 0)),
-            float(data.get("esr", 0)),
-            float(data.get("creatinine", 0)),
-            float(data.get("urea", 0)),
-            float(data.get("bilirubin", 0)),
-            float(data.get("ast", 0)),
-            float(data.get("alt", 0)),
-            float(data.get("inr", 0)),
-            float(data.get("sodium", 0)),
-            float(data.get("potassium", 0)),
-            float(data.get("map", 0)),
-            float(data.get("troponin_positive", 0)),
-            float(data.get("pao2_fio2", 0)),
-            float(data.get("gcs", 0)),
-            float(data.get("urine_output", 0))
+            get_num("spo2", 0),
+            get_num("blood_glucose", 0),
+            get_num("wbc", 0),
+            get_num("platelets", 0),
+            get_num("hemoglobin", 0),
+            get_num("crp", 0),
+            get_num("esr", 0),
+            get_num("creatinine", 0),
+            get_num("urea", 0),
+            get_num("bilirubin", 0),
+            get_num("ast", 0),
+            get_num("alt", 0),
+            get_num("inr", 0),
+            get_num("sodium", 0),
+            get_num("potassium", 0),
+            get_num("map", 0),
+            1.0 if data.get("troponin_positive") in [True, "true", "True", 1, "1", "positive"] else 0.0,
+            get_num("pao2_fio2", 0),
+            get_num("gcs", 0),
+            get_num("urine_output", 0)
         ]
 
         # Convert to numpy array
@@ -1891,157 +2067,169 @@ def send_broadcast():
         cursor.close()
         conn.close()
 
-GEMINI_API_KEY = "AIzaSyD0vvHBsGZz2dYpmNrRuJjDyAMviWBupkM"
+def extract_values_from_text(raw_text): # IMPROVED PARSER
+    """
+    Extremely strict and field-specific OCR parser.
+    Uses exact regex patterns provided to ensure reliable mapping.
+    Missing values return 'NA' for UI clarity.
+    """
+    # 1. Convert to lowercase for uniform processing
+    text = raw_text.lower()
+    
+    # helper for NA extraction
+    def extract_regex(pattern, text, group=1, is_int=False):
+        match = re.search(pattern, text)
+        if match:
+            try:
+                val = match.group(group)
+                return int(val) if is_int else float(val)
+            except:
+                return "NA"
+        return "NA"
+
+    results = {
+        "blood_pressure": "NA", "heart_rate": "NA", "spo2": "NA", "temperature": "NA",
+        "respiratory_rate": "NA", "blood_glucose": "NA", "wbc": "NA", "platelets": "NA",
+        "hemoglobin": "NA", "crp": "NA", "esr": "NA", "creatinine": "NA", "urea": "NA",
+        "bilirubin": "NA", "ast": "NA", "alt": "NA", "inr": "NA", "sodium": "NA",
+        "potassium": "NA", "map": "NA", "troponin_positive": "NA", "pao2_fio2": "NA",
+        "gcs": "NA", "urine_output": "NA",
+        "symptoms": "",
+        "risk_factors": "",
+        "detected_symptoms": [],
+        "detected_risk_factors": []
+    }
+
+    # 3. Blood Pressure (Strict regex as requested)
+    bp_match = re.search(r'\bbp\s*[:\-]?\s*(\d{2,3})', text)
+    if bp_match:
+        results["blood_pressure"] = bp_match.group(1)
+
+    # 4. Heart Rate
+    results["heart_rate"] = extract_regex(r'\b(hr|heart rate)\b\s*[:\-]?\s*(\d+)', text, group=2, is_int=True)
+
+    # 5. SpO2
+    results["spo2"] = extract_regex(r'\bspo2\b\s*[:\-]?\s*(\d+)', text, is_int=True)
+
+    # 6. Temperature
+    results["temperature"] = extract_regex(r'\b(temp|temperature)\b\s*[:\-]?\s*([\d\.]+)', text, group=2)
+
+    # 7. Respiratory Rate
+    results["respiratory_rate"] = extract_regex(r'\b(resp|rr)\b\s*[:\-]?\s*(\d+)', text, group=2, is_int=True)
+
+    # 8. Blood Glucose
+    results["blood_glucose"] = extract_regex(r'\b(bg|glucose)\b\s*[:\-]?\s*(\d+)', text, group=2)
+
+    # 9. Labs (WBC, Hb, Platelets, CRP, ESR)
+    results["wbc"] = extract_regex(r'\bwbc\b\s*[:\-]?\s*(\d+)', text)
+    results["hemoglobin"] = extract_regex(r'\b(hb|hgb|hemoglobin)\b\s*[:\-]?\s*([\d\.]+)', text, group=2)
+    results["platelets"] = extract_regex(r'\b(platelets|plt)\b\s*[:\-]?\s*([\d\.]+)', text, group=2)
+    results["crp"] = extract_regex(r'\bcrp\b\s*[:\-]?\s*([\d\.]+)', text)
+    results["esr"] = extract_regex(r'\besr\b\s*[:\-]?\s*(\d+)', text, is_int=True)
+
+    # 10. Organ function (Creatinine, Urea, Bilirubin, Sodium, Potassium, MAP, INR)
+    results["creatinine"] = extract_regex(r'\b(creatinine|creat|cre)\b\s*[:\-]?\s*([\d\.]+)', text, group=2)
+    results["urea"] = extract_regex(r'\b(urea|bun)\b\s*[:\-]?\s*([\d\.]+)', text, group=2)
+    results["bilirubin"] = extract_regex(r'\b(bilirubin|bil)\b\s*[:\-]?\s*([\d\.]+)', text, group=2)
+    results["sodium"] = extract_regex(r'\b(sodium|na\+)\b\s*[:\-]?\s*([\d\.]+)', text, group=2)
+    results["potassium"] = extract_regex(r'\b(potassium|k\+)\b\s*[:\-]?\s*([\d\.]+)', text, group=2)
+    results["map"] = extract_regex(r'\bmap\b\s*[:\-]?\s*(\d+)', text, is_int=True)
+    results["inr"] = extract_regex(r'\binr\b\s*[:\-]?\s*([\d\.]+)', text)
+
+    # 11. AST / ALT (Dual Capture)
+    ast_alt_match = re.search(r'\bast\s*/\s*alt\s*[:\-]?\s*(\d+\.?\d*)\s*/\s*(\d+\.?\d*)', text)
+    if ast_alt_match:
+        results["ast"] = float(ast_alt_match.group(1))
+        results["alt"] = float(ast_alt_match.group(2))
+    else:
+        results["ast"] = extract_regex(r'\bast\b\s*[:\-]?\s*(\d+)', text)
+        results["alt"] = extract_regex(r'\balt\b\s*[:\-]?\s*(\d+)', text)
+
+    # 12. GCS Score (Capture both for display, use first for severity)
+    gcs_match = re.search(r'gcs[^\d]*(\d+)\s*/\s*(\d+)', text)
+    if gcs_match:
+        results["gcs"] = f"{gcs_match.group(1)}/{gcs_match.group(2)}"
+    else:
+        results["gcs"] = extract_regex(r'gcs\b\s*[:\-]?\s*(\d+)', text, is_int=True)
+
+    # 13. PaO2/FiO2 (Flexible OCR match with o/0 variations)
+    results["pao2_fio2"] = extract_regex(r'pa[o0]2\s*/\s*fi[o0]2\s*[:\-]?\s*(\d+\.?\d*)', text)
+
+    # 14. Urine Output
+    results["urine_output"] = extract_regex(r'\burine output\s*[:\-]?\s*([\d\.]+)', text)
+
+    # 15. Troponin
+    troponin_match = re.search(r'\btroponin\s*[:\-]?\s*(positive|negative)', text)
+    if troponin_match:
+        results["troponin_positive"] = troponin_match.group(1)
+
+    # 18. Symptoms Extraction
+    symp_extracts = []
+    if "dizziness" in text: symp_extracts.append("Dizziness")
+    if "shortness of breath" in text or "sob" in text: symp_extracts.append("Shortness of Breath")
+    if "chest pain" in text: symp_extracts.append("Chest Pain")
+    results["detected_symptoms"] = symp_extracts
+    results["symptoms"] = ", ".join(symp_extracts)
+    
+    # 19. Risk Factors Extraction
+    rf_extracts = []
+    if "diabetes" in text or "diabetic" in text: rf_extracts.append("Diabetes")
+    if "heart disease" in text: rf_extracts.append("Heart Disease")
+    age_match = re.search(r'\bage\b\s*[:\-]?\s*(\d+)', text)
+    if age_match and int(age_match.group(1)) > 60:
+        rf_extracts.append("Age > 60")
+    results["detected_risk_factors"] = rf_extracts
+    results["risk_factors"] = ", ".join(rf_extracts)
+
+    return results
 
 @app.route("/analyze_report", methods=["POST"])
 def analyze_report():
-    data = request.json
-    image_data = data.get("image")  # Base64 encoded image
+    image_data = None
+    
+    # Handle JSON request (Base64)
+    if request.is_json:
+        data = request.json
+        image_data = data.get("image")
+    
+    # Handle Multipart/Form-data (File)
+    else:
+        file = request.files.get("report") or request.files.get("image")
+        if file:
+            image_data = base64.b64encode(file.read()).decode("utf-8")
+        else:
+            image_data = request.form.get("image")
     
     if not image_data:
-        return jsonify({"success": False, "message": "No image data provided"}), 400
-
-    prompt = """
-    You are a professional medical report analyzer. Analyze the provided clinical report image and extract ALL detectable clinical parameters into a structured JSON format. 
-    
-    ### Guidelines:
-    1. EXTRACT ALL available values. If a value is not explicitly mentioned, return null.
-    2. DATA TYPES: Use numbers for laboratory values and vitals (except Blood Pressure). Use boolean for status flags.
-    3. UNITS/SYNONYMS: Recognize common abbreviations and synonyms (e.g., BUN for Urea, Hgb for Hemoglobin). Normalize output to standard numerical values.
-    4. SYMPTOMS: Carefully extract any specific patient symptoms or complaints mentioned in text (e.g., "fever", "cough", "chest pain").
-    
-    ### Map to these exact JSON keys:
-    - "blood_pressure": (String) e.g., "120/80"
-    - "heart_rate": (Number)
-    - "spo2": (Number)
-    - "temperature": (Number)
-    - "respiratory_rate": (Number)
-    - "blood_glucose": (Number)
-    
-    - "wbc": (Number)
-    - "platelets": (Number)
-    - "hemoglobin": (Number)
-    - "crp": (Number)
-    - "esr": (Number)
-    
-    - "creatinine": (Number)
-    - "urea": (Number)
-    - "bilirubin": (Number)
-    - "ast": (Number)
-    - "alt": (Number)
-    - "inr": (Number)
-    - "sodium": (Number)
-    - "potassium": (Number)
-    
-    - "map": (Number)
-    - "troponin_positive": (Boolean) -> true if Troponin is positive/elevated
-    - "pao2_fio2": (Number)
-    - "gcs": (Number) (Total GCS score 3-15)
-    - "urine_output": (Number) (e.g., mL/kg/hr or total L)
-    
-    - "symptoms": (String) Comma-separated list of symptoms found in the report text.
-    
-    ### Output:
-    Return ONLY a valid JSON object. Do not include markdown formatting or backticks.
-    """
+        return jsonify({"success": False, "message": "No image data found."}), 400
 
     try:
-        print("Starting AI Analysis...")
-        # Using gemini-flash-latest as it often has the most reliable free-tier quota
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
+        print("Starting Tesseract OCR Analysis (Local Only)...")
         
         # Clean the image data
         if "," in image_data:
             image_data = image_data.split(",")[1]
             
-        # Detect mime type
-        mime_type = "image/jpeg"
-        if image_data.startswith("iVBORw0KGgo"):
-             mime_type = "image/png"
-        elif image_data.startswith("R0lGOD"):
-             mime_type = "image/gif"
+        # Perform OCR using Tesseract
+        img_bytes = base64.b64decode(image_data)
+        img = Image.open(io.BytesIO(img_bytes))
         
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": prompt + "\n\nIMPORTANT: Return ONLY a valid JSON object. Do not include markdown formatting or backticks."},
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": image_data
-                            }
-                        }
-                    ]
-                }
-            ]
-        }
-
-        response = requests.post(
-            url, 
-            headers={"Content-Type": "application/json"}, 
-            json=payload, 
-            timeout=30
-        )
+        # Extract raw text
+        raw_text = pytesseract.image_to_string(img)
+        print(f"OCR completed. Text length: {len(raw_text)}")
         
-        if response.status_code != 200:
-            error_json = response.json() if response.text else {}
-            error_msg = error_json.get("error", {}).get("message", "Unknown Gemini Error")
-            print(f"Gemini API Error: {response.status_code} - {error_msg}")
-            return jsonify({
-                "success": False, 
-                "message": f"AI Error ({response.status_code}): {error_msg[:120]}",
-                "details": response.text
-            }), 500
-            
-        response_data = response.json()
+        # Use our local parser to extract values from text
+        extracted_data = extract_values_from_text(raw_text)
         
-        if "candidates" in response_data and response_data["candidates"]:
-            candidate = response_data["candidates"][0]
-            if "content" in candidate and "parts" in candidate["content"]:
-                content = candidate["content"]["parts"][0]["text"]
-                print("Extracted content successfully")
-                try:
-                    # AI might sometimes wrap JSON in backticks despite generationConfig
-                    json_str = content.strip()
-                    if json_str.startswith("```json"):
-                        json_str = json_str.replace("```json", "").replace("```", "").strip()
-                    elif json_str.startswith("```"):
-                        json_str = json_str.replace("```", "").strip()
-                        
-                    analysis_result = json.loads(json_str)
-                    
-                    # Ensure all requested keys exist with defaults
-                    all_keys = {
-                        "blood_pressure": "0/0", "heart_rate": 0, "spo2": 0, "temperature": 0.0,
-                        "respiratory_rate": 0, "blood_glucose": 0.0, "wbc": 0.0, "platelets": 0.0,
-                        "hemoglobin": 0.0, "crp": 0.0, "esr": 0.0, "creatinine": 0.0, "urea": 0.0,
-                        "bilirubin": 0.0, "ast": 0.0, "alt": 0.0, "inr": 0.0, "sodium": 0.0,
-                        "potassium": 0.0, "map": 0.0, "troponin_positive": False, "pao2_fio2": 0.0,
-                        "gcs": 15, "urine_output": 0.0, "symptoms": ""
-                    }
-                    
-                    for key, default in all_keys.items():
-                        if key not in analysis_result or analysis_result[key] is None:
-                            analysis_result[key] = default
-                            
-                    return jsonify({
-                        "success": True,
-                        "data": analysis_result
-                    })
-                except json.JSONDecodeError as je:
-                    print(f"JSON Parse Error: {je}")
-                    return jsonify({"success": False, "message": "The AI response was not in the correct format.", "raw": content}), 500
-            else:
-                return jsonify({"success": False, "message": "The AI returned an empty response.", "details": response_data}), 500
-        else:
-            reason = response_data.get("promptFeedback", {}).get("blockReason", "UnknownReason")
-            return jsonify({"success": False, "message": f"AI process blocked: {reason}", "details": response_data}), 500
+        return jsonify({
+            "success": True,
+            "data": extracted_data,
+            "is_ocr": True
+        })
             
     except Exception as e:
-        print("Analysis Exception:", e)
-        return jsonify({"success": False, "message": f"Connection Error: {str(e)}"}), 500
-
+        print(f"Tesseract OCR Error: {e}")
+        return jsonify({"success": False, "message": f"Error during OCR analysis: {str(e)}"}), 500
 @app.route("/get_reports", methods=["GET"])
 def get_reports():
     return get_admin_reports()
