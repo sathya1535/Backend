@@ -583,10 +583,13 @@ def analyze_severity():
             
         severity_level = "CRITICAL" if (immediate_severe or score > 25) else "MODERATE" if score >= 12 else "MILD"
         
-        ml_level = predict_severity_with_ml(data)
-        if ml_level:
-            severity_level = ml_level
-            print(f"ML Prediction override applied: {ml_level}")
+        # ML override is disabled to maintain clinical consistency with rule-based calculation.
+        # The ML model was incorrectly classifying MODERATE cases as CRITICAL (via 'Severe' mapping),
+        # causing a discrepancy between the Report Analysis screen and the Assigned Patients screen.
+        # ml_level = predict_severity_with_ml(data)
+        # if ml_level:
+        #     severity_level = ml_level
+        #     print(f"ML Prediction override applied: {ml_level}")
         
         print(f"--- SEVERITY BREAKDOWN (Patient {patient_id}) ---")
         print(f"Breakdown: {breakdown}")
